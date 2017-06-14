@@ -1,305 +1,332 @@
-#include "application.h"
-
-#include "amp.h"
+#include "buzz.h"
+#include "neopixel/neopixel.h"
+#include "ws.h"
+#include "webos.h"
 #include "xml.h"
 #include "uhttp.h"
+#include "amp.h"
+#include "sha.h"
 
-#include <stdint.h>
-#include <math.h>
+// create shorthand for the pins
+static const int quadA = D2;
+static const int quadB = D3;
+static const int button = D5;
+static const int lbo = A2;
+static const int ledDataIn = D6;
+static const int led2 = D7;
 
-namespace {
+static int light = LOW;
 
-TCPClient client;
-uint8_t server[] = {192, 168, 1, 192}; // TODO: write setter
-const int RESPONSE_BUF_LENGTH = 2048;
-char response[RESPONSE_BUF_LENGTH];
+int count = 0;
+int last_count = count;
+bool a_ = false;
+bool b_ = false;
 
-bool sendAmp(const char* cmd, const char** body = NULL, int* length = NULL) {
-  int size = strlen(cmd);
-  if (client.connect(server, 80))
-  {
-    client.println("POST /YamahaRemoteControl/ctrl HTTP/1.1");
-    client.println("Host: 192.168.1.192");
-    client.print("Content-Length: "); client.println(size);
-    client.println();
-    client.println(cmd);
+int sleepCounter = 0;
 
-    memset(response, 0, RESPONSE_BUF_LENGTH);
-    int pos = 0;
-    while (client.connected()) {
-        if (client.available()) {
-            int c = client.read();
-            if (c > -1) {
-                response[pos++] = (char)c;
-                Serial.print((char)c);
-            }
+amp::State ampState;
+
+Adafruit_NeoPixel strip = Adafruit_NeoPixel(24, ledDataIn, WS2812B);
+Adafruit_DRV2605 drv;
+
+void buzz(int upDown) {
+  static uint8_t hapticEffect = 47; // sharp click
+  drv.setWaveform(0, hapticEffect);  // play effect
+  drv.setWaveform(1, 0);       // end waveform
+  drv.go();
+  //hapticEffect+=upDown;
+  if (hapticEffect > 117) hapticEffect = 1;
+  if (hapticEffect <= 0) hapticEffect = 117;
+}
+
+class VolumeState {
+public:
+    VolumeState () { c = 0; last = 0; }
+
+    float get() { return v; }
+
+    bool shouldUpdate() { return c != last; }
+
+    float desired() { last = c; return v_d; };
+
+    void want(float val) {
+        float diff = v_d - val;
+        if (diff < 0)
+            diff = -diff;
+
+        if (diff < 0.001)
+            return;
+
+        v_d = val;
+        c++;
+    }
+
+    void is(float val) { v = val; }
+
+private:
+    float v;
+    float v_d;
+    int c, last;
+};
+
+bool volStateInitialized = false;
+VolumeState volState;
+
+os_thread_return_t ampThreadLoop(void* nothing){
+    while(true) {
+        amp::getState(&ampState);
+        //amp::printState(&ampState);
+        volState.is(ampState.vol);
+        if (!volStateInitialized) {
+            volStateInitialized = true;
+            count = ampState.vol * 255;
+        }
+
+        if (volState.shouldUpdate()) {
+            float d = volState.desired();
+            amp::setVolume(d);
+            delay(100);
+        } else {
+            delay(400);
         }
     }
-    if (!client.connected()) {
-        client.stop();
+}
+
+os_thread_return_t tvThreadLoop(void* nothing){
+    while(true) {
+        Serial.println("tvState.vol..");
+
+        webos::getVolume();
+        //amp::printState(&ampState);
+        delay(1500);
     }
-    return uhttp::parseHeader(response, body, length) == 200;
-  }
-  return false;
 }
 
-} // end anonymous namespace
-
-namespace amp {
-
-int getVol() {
-  const char *volGetCommand = "<YAMAHA_AV cmd=\"GET\"><Main_Zone><Volume><Lvl>GetParam</Lvl></Volume></Main_Zone></YAMAHA_AV>";
-  //const char *resp = "<YAMAHA_AV rsp=\"GET\" RC=\"0\"><Main_Zone><Volume><Lvl><Val>-445</Val><Exp>1</Exp><Unit>dB</Unit></Lvl></Volume></Main_Zone></YAMAHA_AV>";
-
-  int length = 0;
-  const char *resp;
-  sendAmp(volGetCommand, &resp, &length);
-  if (length <= 0) {
-    return -1000;
-  }
-  const char *pathVol[] = {"YAMAHA_AV", "Main_Zone", "Volume", "Lvl", "Val"};
-  const char *pathUnit[] = {"YAMAHA_AV", "Main_Zone", "Volume", "Lvl", "Unit"};
-  const char *pathExp[] = {"YAMAHA_AV", "Main_Zone", "Volume", "Lvl", "Exp"};
-  const char* text = NULL;
-  const char* textEnd = NULL;
-
-  //char* unit = NULL;
-  float vol = -2000;
-  if (getText(resp, pathVol, 5, &text, &textEnd)) {
-    vol = strtola(text, textEnd);
-  }
-  if (getText(resp, pathUnit, 5, &text, &textEnd)) {
-    //unit = (char*)calloc(sizeof(char), 1+textEnd-text);
-  }
-  if (getText(resp, pathExp, 5, &text, &textEnd)) {
-    vol /= pow(10, strtola(text, textEnd));
-  }
-  return vol;
-}
-
-
-bool getPower() { 
-  const char *volGetBasicStatus = "<YAMAHA_AV cmd=\"GET\"><Main_Zone><Basic_Status>GetParam</Basic_Status></Main_Zone></YAMAHA_AV>";
-//  const char *volGetBasicStatus = "<YAMAHA_AV cmd=\"GET\"><Main_Zone><Basic_Status><Volume>GetParam</Volume></Basic_Status></Main_Zone></YAMAHA_AV>";
-  int length = 0;
-  const char *resp;
-  sendAmp(volGetBasicStatus, &resp, &length);
-  Serial.print("amp::getPower ");
-  Serial.print(resp);
-  
-  return false; 
-}
-bool getMute() { return false; }
-int getInput() { return false; }
-
-int getState(State* ret) {
-   const char *volGetBasicStatus = "<YAMAHA_AV cmd=\"GET\"><Main_Zone><Basic_Status>GetParam</Basic_Status></Main_Zone></YAMAHA_AV>";
-  int length = 0;
-  const char *resp;
-  sendAmp(volGetBasicStatus, &resp, &length);
-
-  const char *pathPower[] = {"YAMAHA_AV", "Main_Zone", "Basic_Status", "Power_Control", "Power"};
-  const char *pathVol[] = {"YAMAHA_AV", "Main_Zone", "Basic_Status", "Volume", "Lvl", "Val"};
-  const char *pathUnit[] = {"YAMAHA_AV", "Main_Zone", "Basic_Status", "Volume", "Lvl", "Unit"};
-  const char *pathExp[] = {"YAMAHA_AV", "Main_Zone", "Basic_Status", "Volume", "Lvl", "Exp"};
-  const char *pathMute[] = {"YAMAHA_AV", "Main_Zone", "Basic_Status", "Volume", "Mute"};
-  const char *pathInput[] = {"YAMAHA_AV", "Main_Zone", "Basic_Status", "Input", "Input_Sel"};
-  
-  const char* text = NULL;
-  const char* textEnd = NULL;
-  
-  bool mute = false;
-  bool inputTV = false;
-  bool power = false;
-  float vol = -2000;
-
-  if (getText(resp, pathVol, 6, &text, &textEnd)) {
-    vol = strtola(text, textEnd);
-  }
-  if (getText(resp, pathExp, 6, &text, &textEnd)) {
-    vol /= pow(10, strtola(text, textEnd));
-  } else {
-    return -1;
-  }
-
-  //char* unit = NULL;
-  if (getText(resp, pathUnit, 6, &text, &textEnd)) {
-    int length = textEnd - text;
-    bool decibel = length == 2 && strncmp(text, "dB", length) == 0;
-    //bool units = length == 2 && strncmp(text, "dB", length) == 0;
-    
-    if (decibel) {
-        static const float max = 16.5f;
-        static const float min = -80.5f;
-        vol = (vol - min) / (max - min);
+int offset = 0;
+os_thread_return_t cycleOffsetLoop(void* nothing){
+    while(true) {
+        delay(100);
+        offset += 3;
     }
-    //if (units) {
-    //    vol = vol / 2;
-    //}
-    //unit = (char*)calloc(sizeof(char), 1+textEnd-text);
+}
+
+
+void setup()
+{
+    pinMode(quadA, INPUT);
+    pinMode(quadB, INPUT);
+    pinMode(button, INPUT);
+    strip.begin();
+    strip.show(); // Initialize all pixels to 'off'
+
+    drv.begin();
+    drv.selectLibrary(1);
+    drv.setMode(DRV2605_MODE_INTTRIG);
+    drv.useERM();
+
+    attachInterrupt(quadA, quadDecodeA, CHANGE);
+    attachInterrupt(quadB, quadDecodeB, CHANGE);
+    attachInterrupt(button, buttonPress, CHANGE);
+
+    pinMode(led2, OUTPUT);
+    digitalWrite(led2, light);
+
+    Serial.begin(115200);
+    Particle.function("ampPower", ampPower);
+    Particle.function("getPower", ampGetPower);
+    //Particle.function("ampVolume", ampVol);
+    Particle.function("getState", getState);
+
+    Particle.function("tvVolume", tvVol);
+    a_ = pinReadFast(quadA);
+    b_ = pinReadFast(quadB);
+
+
+    Thread* ampThread = new Thread("ampThread", ampThreadLoop, NULL);
+    //Thread* tvThread = new Thread("tvThread", tvThreadLoop, NULL);
+    Thread* colorfulThread = new Thread("cycleOffsetThread", cycleOffsetLoop, NULL);
+
+    //mediaPCThread = new Thread("mediaPCThread", pingThreadLoop, (void*)"tv.lan");
+    //nasThread = new Thread("nasThread", pingThreadLoop, (void*)"nas.lan");
+    rainbow(3);
+}
+
+int last_time = 0;
+
+void loop() {
+  handleRotation();
+  //handleAmp();
+  //handleTV();
+  //handlePings();
+  //handlePower();
+
+  //rainbow(20);
+  //off();
+  //delay(1000);
+  if (++sleepCounter > 10) {
+    //gotoSleep();
+  }
+}
+
+int center = 0;
+
+void handleRotation() {
+  if (count < 0) count = 0;
+  if (count > 255) count = 255;
+  if (last_count != count) {
+    Serial.println(count);
+    last_count = count;
   }
 
-  if (getText(resp, pathMute, 5, &text, &textEnd)) {
-    int length = textEnd - text;
-    mute = length == 2 && strncmp(text, "On", length) == 0;
-  } else {
-    return -1;
-  }
-  if (getText(resp, pathInput, 5, &text, &textEnd)) {
-    int length = textEnd - text;
-    //inputHDMI = length == 5 && strncmp(text, "HDMI1", length) == 0;
-    inputTV = length == 3 && strncmp(text, "AV1", length) == 0;
-  } else {
-    return -1;
-  }
-  if (getText(resp, pathPower, 5, &text, &textEnd)) {
-    int length = textEnd - text;
-    power = length == 2 && strncmp(text, "On", length) == 0;
-  } else {
-    return -1;
-  }
-  
-  Serial.println("---");
-  Serial.print("power: "); if (power)      {Serial.println("yes");} else {Serial.println("no");}
-  Serial.print("vol:   "); Serial.println(vol); //Serial.println(unit);
-  Serial.print("mute:  "); if (mute)      {Serial.println("yes");} else {Serial.println("no");}
-  Serial.print("tv:    "); if (inputTV)   {Serial.println("yes");} else {Serial.println("no");}
-  Serial.println("---");
+  int clicks = count / 4;
+  float vol = count / 255.0f;
+  volState.want(vol);
+  visualizeQuadCounting(volState.get()*24.0f);
+}
 
-  if (inputTV && power) {
-    Serial.println("mode: green");
+void gotoSleep() {
+  System.sleep(button, CHANGE);
+  System.reset();
+}
+
+void quadDecodeA() {
+  bool a = pinReadFast(quadA);
+  bool b = pinReadFast(quadB);
+  count += parse(a,b);
+  a_ = a;
+  b_ = b;
+}
+
+void quadDecodeB() {
+  bool a = pinReadFast(quadA);
+  bool b = pinReadFast(quadB);
+  count += parse(a,b);
+  a_ = a;
+  b_ = b;
+}
+
+int lastDebounceTime = 0;
+
+int buttonPress() {
+    if (!pinReadFast(button)) {
+        if ((millis() - lastDebounceTime) > 200)
+        {
+            lastDebounceTime = millis();
+
+            light = !light;
+            digitalWrite(led2, light);
+            buzz(0);
+        }
+    }
+}
+
+int parse(bool a, bool b) {
+  if(a_ && b_){
+    if(!a && b) return 1;
+    if(a && !b) return -1;
+  } else if(!a_ && b_){
+    if(!a && !b) return 1;
+    if(a && b) return -1;
+  } else if(!a_ && !b_){
+    if(a && !b) return 1;
+    if(!a && b) return -1;
+  } else if(a_ && !b_){
+    if(a && b) return 1;
+    if(!a && !b) return -1;
   }
-  if (!power) {
-    Serial.println("mode: red");
-  }
-  Serial.println("---");
-  
-  if (ret) {
-    ret->mute = mute;
-    ret->inputTV = inputTV;
-    ret->power = power;
-    ret->vol = vol;
-  }
-  
   return 0;
 }
 
+
+int ampPower(String command) {
+    if (command=="on") {
+        return amp::turnOn();
+    }
+    else if (command=="off") {
+        return amp::turnOff();
+    }
+    else {
+        return -1;
+    }
+}
+
+int ampGetPower(String command) {
+    return amp::getPower();
+}
+int getState(String command) {
+    unsigned long time1 = millis();
+
+    return amp::getState();
+    Serial.println(millis() - time1);
+}
+
 /*
-<YAMAHA_AV rsp="GET" RC="0">
-  <Main_Zone>
-    <Basic_Status>
-      <Power_Control>
-        <Power>On</Power>
-        <Sleep>Off</Sleep>
-      </Power_Control>
-      <Volume>
-        <Lvl>
-          <Val>-440</Val>
-          <Exp>1</Exp>
-          <Unit>dB</Unit>
-        </Lvl>
-        <Mute>On</Mute>
-        <Subwoofer_Trim>
-          <Val>0</Val>
-          <Exp>1</Exp>
-          <Unit>dB</Unit>
-        </Subwoofer_Trim>
-        <Scale>0-97</Scale>
-      </Volume>
-      <Input>
-        <Input_Sel>HDMI1</Input_Sel>
-        <Input_Sel_Item_Info>
-          <Param>HDMI1</Param>
-          <RW>RW</RW>
-          <Title>Media PC</Title>
-          <Icon>
-            <On>/YamahaRemoteControl/Icons/icon004.png</On>
-            <Off />
-          </Icon>
-          <Src_Name />
-          <Src_Number>1</Src_Number>
-        </Input_Sel_Item_Info>
-      </Input>
-      <Surround>
-        <Program_Sel>
-          <Current>
-            <Straight>On</Straight>
-            <Enhancer>Off</Enhancer>
-            <Sound_Program>5ch Stereo</Sound_Program>
-          </Current>
-        </Program_Sel>
-        <_3D_Cinema_DSP>Auto</_3D_Cinema_DSP>
-      </Surround>
-      <Party_Info>Off</Party_Info>
-      <Sound_Video>
-        <Tone>
-          <Bass>
-            <Val>-10</Val>
-            <Exp>1</Exp>
-            <Unit>dB</Unit>
-          </Bass>
-          <Treble>
-            <Val>0</Val>
-            <Exp>1</Exp>
-            <Unit>dB</Unit>
-          </Treble>
-        </Tone>
-        <Direct>
-          <Mode>Off</Mode>
-        </Direct>
-        <HDMI>
-          <Standby_Through_Info>On</Standby_Through_Info>
-          <Output>
-            <OUT_1>On</OUT_1>
-          </Output>
-        </HDMI>
-        <Extra_Bass>Off</Extra_Bass>
-        <Adaptive_DRC>Off</Adaptive_DRC>
-      </Sound_Video>
-    </Basic_Status>
-  </Main_Zone>
-</YAMAHA_AV>
+int ampVol(String command) {
+    if (command=="up") {
+        //amp::setVol(-440);
+        return amp::getVol();
+    }
+    else if (command=="down") {
+        amp::setVol(-805);
+        return amp::getVol();
+    }
+    else {
+        return -1;
+    }
+}
 */
 
-
-
-
-
-
-// updateState();
-
-//const char *volUpCmd = "<YAMAHA_AV cmd=\"PUT\"><Main_Zone><Volume><Lvl><Val>Up 1 dB</Val><Exp></Exp><Unit></Unit></Lvl></Volume></Main_Zone></YAMAHA_AV>";
-//const char *volDownCmd = "<YAMAHA_AV cmd=\"PUT\"><Main_Zone><Volume><Lvl><Val>Down 1 dB</Val><Exp></Exp><Unit></Unit></Lvl></Volume></Main_Zone></YAMAHA_AV>";
-
-bool setVolUp() {
-    const char *volUpCmd = "<YAMAHA_AV cmd=\"PUT\"><Main_Zone><Volume><Lvl><Val>Up 1 dB</Val><Exp></Exp><Unit></Unit></Lvl></Volume></Main_Zone></YAMAHA_AV>";
-    return sendAmp(volUpCmd);
+int tvVol(String command) {
+    webos::getVolume();
+    return 0;
 }
 
-bool setVolDown() {
-    const char *volDownCmd = "<YAMAHA_AV cmd=\"PUT\"><Main_Zone><Volume><Lvl><Val>Down 1 dB</Val><Exp></Exp><Unit></Unit></Lvl></Volume></Main_Zone></YAMAHA_AV>";
-    return sendAmp(volDownCmd);
+void off() {
+  uint16_t n = strip.numPixels();
+
+  for(uint16_t i=0; i<n; i++) {
+    strip.setPixelColor(i, 0);
+  }
+  strip.show();
 }
 
-bool setVolume(float vol) {
-    float min = -80.5f;
-    float max = 16.5f;
-    float volume = (vol*(max-min)) + min;
-    int r = 10.0f * roundf(volume * 2.0f) / 2.0f;
 
-    char cmd[150]; // 126 + x
-    sprintf(cmd, "<YAMAHA_AV cmd=\"PUT\"><Main_Zone><Volume><Lvl><Val>%d</Val><Exp>1</Exp><Unit>dB</Unit></Lvl></Volume></Main_Zone></YAMAHA_AV>", r);
-    return sendAmp(cmd);
+void visualizeQuadCounting(uint8_t pos) {
+  uint16_t n = strip.numPixels();
+  //strip.setPixelColor(0, 0x100000);
+  for(uint16_t i=0; i<n; i++) {
+      if (i <= (pos % n)) {
+        strip.setPixelColor(i, Wheel((int)(offset + (i * 255.0 / n)) & 255, ((float)0xc) / 0xff));
+      } else {
+        strip.setPixelColor(i, 0x0);
+      }
+  }
+  strip.show();
 }
 
-bool toggleMute() { return false; }
+void rainbow(uint8_t wait) {
+  uint16_t i, j;
+  uint16_t n = strip.numPixels();
 
-bool turnOff() {
-    return sendAmp("<YAMAHA_AV cmd=\"PUT\"><System><Power_Control><Power>Standby</Power></Power_Control></System></YAMAHA_AV>");
+  for(j=0; j<256; j++) {
+    for(i=0; i<n; i++) {
+      strip.setPixelColor(i, Wheel((5*i+j) & 255, 0.05));
+    }
+    strip.show();
+    delay(wait);
+  }
 }
 
-bool turnOn() {
-    return sendAmp("<YAMAHA_AV cmd=\"PUT\"><System><Power_Control><Power>On</Power></Power_Control></System></YAMAHA_AV>");
+// Input a value 0 to 255 to get a color value.
+// The colours are a transition r - g - b - back to r.
+uint32_t Wheel(byte WheelPos, float brightness) {
+  if(WheelPos < 85) {
+   return strip.Color(brightness * WheelPos * 3, brightness * (255 - WheelPos * 3), 0);
+  } else if(WheelPos < 170) {
+   WheelPos -= 85;
+   return strip.Color(brightness * (255 - WheelPos * 3), 0, brightness * WheelPos * 3);
+  } else {
+   WheelPos -= 170;
+   return strip.Color(0, brightness * WheelPos * 3, brightness * (255 - WheelPos * 3));
+  }
 }
-
-} // end anonymous namespace
